@@ -1,47 +1,70 @@
-// NAME: Quick Queue
-// AUTHOR: OhItsTom
+// NAME: Quick Queue (1.3.x fix)
+// AUTHOR: OhItsTom, Spotify 1.3.x patch by kirmitboi1123 (2026-10-25)
 // DESCRIPTION: Adds a button to the tracklist to add/remove a song from the queue.
+//
+// ohitstom/spicetify-extensions quickQueue.js (main @ 2d76dc5), patched for Spotify 1.3.6
+// (fork: kirmitboi1123/spicetify-extensions, branch quickqueue-spotify-1.3.6). Upstream is
+// broken there (issue #79; a different, unmerged fix is in PR #80):
+//   1. the track URI is no longer in the props the old lookup reads - it now sits a couple
+//      of React fiber levels above the [role="row"] element, so walk up the fiber;
+//   2. rows are inserted empty and filled in afterwards, and virtualised rows are recycled
+//      for other tracks while scrolling, so rows are (re)processed on every mutation inside
+//      them, batched on a timer, and the button is re-mounted when the row's URI changes.
+// Uses the same .queueControl-wrapper class as upstream and skips rows that already have
+// one, so it can run as a local extension next to the Marketplace copy without doubling up.
+// Drop it once upstream is fixed.
 
-(function quickQueue() {
+(function quickQueueFix() {
 	if (
 		!(
 			Spicetify.React &&
 			Spicetify.ReactDOM &&
-			Spicetify.SVGIcons &&
 			Spicetify.showNotification &&
-			Spicetify.Platform.PlayerAPI &&
+			Spicetify.Platform?.PlayerAPI &&
 			Spicetify.Tippy &&
 			Spicetify.TippyProps &&
-			Spicetify.Locale._dictionary &&
-			Spicetify.Mousetrap
+			Spicetify.LocalStorage
 		)
 	) {
-		setTimeout(quickQueue, 10);
+		setTimeout(quickQueueFix, 10);
 		return;
 	}
 
-	// Settings
-	const STORAGE_KEY_PLACE_LEFT = "quickQueue.placeLeftSide";
-	let placeLeftSide = Spicetify.LocalStorage.get(STORAGE_KEY_PLACE_LEFT) === "1";
+	const dict = () => Spicetify.Locale?._dictionary || {};
 
+	// Settings: same key as upstream. The Marketplace copy (if still installed) registers the
+	// "Button on the left" menu item and writes this key, so only register our own item when
+	// it is gone, and pick the setting up live either way.
+	const STORAGE_KEY_PLACE_LEFT = "quickQueue.placeLeftSide";
+	const readPlaceLeft = () => Spicetify.LocalStorage.get(STORAGE_KEY_PLACE_LEFT) === "1";
+	let placeLeftSide = readPlaceLeft();
+
+	function applyPlacement() {
+		placeLeftSide = readPlaceLeft();
+		// Move the buttons that are already rendered
+		document.querySelectorAll('.queueControl-wrapper[data-qq-fix="1"]').forEach(wrapper => {
+			Spicetify.ReactDOM.unmountComponentAtNode?.(wrapper);
+			wrapper.remove();
+		});
+		document.querySelectorAll('[role="row"]').forEach(schedule);
+	}
+	setInterval(() => readPlaceLeft() !== placeLeftSide && applyPlacement(), 1000);
+
+	const upstreamLoaded = !!document.querySelector('script[src*="quickQueue/quickQueue.js"]');
 	try {
-		if (Spicetify.Menu?.Item) {
-			new Spicetify.Menu.Item(
-				"Quick Queue: Button on the left",
-				placeLeftSide,
-				self => {
-					placeLeftSide = !placeLeftSide;
-					self.setState(placeLeftSide);
-					Spicetify.LocalStorage.set(STORAGE_KEY_PLACE_LEFT, placeLeftSide ? "1" : "0");
-					Spicetify.showNotification(`Quick Queue placement is now ${placeLeftSide ? "on the left" : "in the right column"}`);
-				}
-			).register();
+		if (!upstreamLoaded && Spicetify.Menu?.Item) {
+			new Spicetify.Menu.Item("Quick Queue: Button on the left", placeLeftSide, self => {
+				Spicetify.LocalStorage.set(STORAGE_KEY_PLACE_LEFT, placeLeftSide ? "0" : "1");
+				applyPlacement();
+				self.setState(placeLeftSide);
+				Spicetify.showNotification(`Quick Queue placement is now ${placeLeftSide ? "on the left" : "in the right column"}`);
+			}).register();
 		}
 	} catch (error) {
 		// no-op: menu might not be available in all environments
 	}
 
-	const QueueButton = Spicetify.React.memo(({ uri, classList, leftSide }) => {
+	const QueueButton = Spicetify.React.memo(({ uri, classList }) => {
 		const [isQueued, setIsQueued] = Spicetify.React.useState(Spicetify.Platform.PlayerAPI._queue._queueState.queued.some(item => item.uri === uri));
 		const [tippyInstance, setTippyInstance] = Spicetify.React.useState(null);
 		const [isShiftPressed, setIsShiftPressed] = Spicetify.React.useState(false);
@@ -62,16 +85,16 @@
 				Spicetify.showNotification("Added to next in queue");
 			} else {
 				Spicetify.Platform.PlayerAPI[isQueued ? "removeFromQueue" : "addToQueue"]([{ uri }]);
-				Spicetify.showNotification(isQueued ? "Removed from queue" : Spicetify.Locale._dictionary["queue.added-to-queue"] || "Added to queue");
+				Spicetify.showNotification(isQueued ? "Removed from queue" : dict()["queue.added-to-queue"] || "Added to queue");
 			}
 		};
 
 		const getTooltipContent = () => {
 			return isQueued
-				? Spicetify.Locale._dictionary["contextmenu.remove-from-queue"] || "Remove from queue"
+				? dict()["contextmenu.remove-from-queue"] || "Remove from queue"
 				: isShiftPressed
 				? "Play next in queue"
-				: Spicetify.Locale._dictionary["contextmenu.add-to-queue"] || "Add to queue";
+				: dict()["contextmenu.add-to-queue"] || "Add to queue";
 		};
 
 		Spicetify.React.useEffect(() => {
@@ -158,139 +181,110 @@
 		});
 	}
 
-	function getTracklistTrackUri(tracklistElement) {
-		// 1. Try specific known paths first (Fast & Reliable for standard rows)
-		const values = Object.values(tracklistElement);
-		const reactProps = values.find((v) => v?.pendingProps || v?.memoizedProps);
-		const props = reactProps?.pendingProps || reactProps?.memoizedProps;
-
-		if (props) {
-			const specificUri =
-				props.children?.[0]?.props?.children?.props?.uri ||
-				props.children?.[0]?.props?.children?.props?.children?.props?.uri ||
-				props.children?.[0]?.props?.children?.[0]?.props?.uri ||
-				props.children?.props?.value?.item?.uri ||
-				props.value?.item?.uri;
-
-			if (typeof specificUri === 'string' && specificUri.startsWith("spotify:"))
-				return specificUri;
+	// Spotify 1.3.x: the row's own props no longer carry the URI; a component a few fiber
+	// levels up does (props.uri, or props.item.uri / props.value.item.uri higher still).
+	const isTrackUri = value => typeof value === "string" && /^spotify:(track|episode|local):/.test(value);
+	function getRowUri(row) {
+		const fiberKey = Object.keys(row).find(key => key.startsWith("__reactFiber"));
+		let fiber = fiberKey && row[fiberKey];
+		for (let depth = 0; fiber && depth < 25; depth++, fiber = fiber.return) {
+			const props = fiber.memoizedProps;
+			if (!props || typeof props !== "object") continue;
+			for (const value of [props.uri, props.item?.uri, props.value?.item?.uri, props.track?.uri]) {
+				if (isTrackUri(value)) return value;
+			}
 		}
+		return null;
+	}
 
-		// 2. Recursive fallback (For recommendations and new structures)
-		const findUri = (obj, seen = new WeakSet()) => {
-			if (!obj || typeof obj !== "object" || seen.has(obj)) return null;
-			seen.add(obj);
+	function processRow(row) {
+		if (!row.isConnected) return;
+		// row > .main-trackList-trackListRow > last cell (duration, add-to-playlist, more)
+		const endCell = row.firstElementChild?.lastElementChild;
+		if (!endCell) return;
+		const entryPoint = endCell.querySelector(":scope > button:not(:last-child):has([data-encore-id])");
+		if (!entryPoint) return; // row not filled in yet; a later mutation brings us back
 
-			if (typeof obj.uri === 'string' && obj.uri.startsWith("spotify:")) return obj.uri;
-			if (typeof obj.item?.uri === 'string' && obj.item.uri.startsWith("spotify:"))
-				return obj.item.uri;
-			if (typeof obj.value?.item?.uri === 'string' && obj.value.item.uri.startsWith("spotify:"))
-				return obj.value.item.uri;
+		const uri = getRowUri(row);
+		if (!uri) return;
 
-			// Check children
-			const children = obj.children || obj.props?.children;
-			if (children) {
-				if (Array.isArray(children)) {
-					for (const child of children) {
-						const result = findUri(child.props || child, seen);
-						if (result) return result;
-					}
-				} else {
-					const result = findUri(children, seen);
-					if (result) return result;
+		let wrapper = row.querySelector(".queueControl-wrapper");
+		if (wrapper && wrapper.dataset.qqFix !== "1") return; // upstream's button is already here
+		if (wrapper && wrapper.dataset.uri === uri) return;
+
+		if (!wrapper) {
+			// Decide insertion target
+			let insertionParent = endCell;
+			let referenceNode = entryPoint;
+			if (placeLeftSide) {
+				const startCell = endCell.parentElement?.querySelector(':scope > .main-trackList-rowSectionStart[role="gridcell"]');
+				if (startCell) {
+					insertionParent = startCell;
+					// Before the cover image if there is one (albums have none)
+					referenceNode = startCell.querySelector(":scope img") || startCell.firstElementChild;
 				}
 			}
 
-			if (obj.props && obj.props !== obj) {
-				const result = findUri(obj.props, seen);
-				if (result) return result;
+			wrapper = document.createElement("div");
+			wrapper.className = "queueControl-wrapper";
+			wrapper.dataset.qqFix = "1";
+			wrapper.style.display = "contents";
+			wrapper.style.marginRight = 0;
+			if (referenceNode && referenceNode.parentNode === insertionParent) insertionParent.insertBefore(wrapper, referenceNode);
+			else if (insertionParent.firstChild) insertionParent.insertBefore(wrapper, insertionParent.firstChild);
+			else insertionParent.appendChild(wrapper);
+		}
+
+		// A recycled row gets a new key, so React mounts a fresh button for the new track.
+		wrapper.dataset.uri = uri;
+		Spicetify.ReactDOM.render(
+			Spicetify.React.createElement(QueueButton, {
+				key: uri,
+				uri,
+				classList: entryPoint.classList
+			}),
+			wrapper
+		);
+	}
+
+	// Batch with a timer, not requestAnimationFrame: Chromium pauses rAF while the window is
+	// covered or minimised, so rows went unprocessed until Spotify was looked at.
+	const pendingRows = new Set();
+	let batchQueued = false;
+	function schedule(row) {
+		pendingRows.add(row);
+		if (batchQueued) return;
+		batchQueued = true;
+		setTimeout(() => {
+			batchQueued = false;
+			const rows = [...pendingRows];
+			pendingRows.clear();
+			for (const row of rows) {
+				try {
+					processRow(row);
+				} catch (error) {
+					console.error("Quick Queue (1.3.x fix): failed on a row", error, row);
+				}
 			}
-
-			return null;
-		};
-
-		return findUri(props || tracklistElement);
+		}, 0);
 	}
 
 	const observer = new MutationObserver(mutationList => {
-		mutationList.forEach(mutation => {
-			mutation.addedNodes.forEach(node => {
-				const nodeMatch =
-					node.attributes?.role?.value === "row"
-						? node.firstChild?.lastChild
-						: node.firstChild?.attributes?.role?.value === "row"
-						? node.firstChild?.firstChild.lastChild
-						: null;
-
-				if (nodeMatch) {
-					const entryPoint = nodeMatch.querySelector(":scope > button:not(:last-child):has([data-encore-id])");
-
-					if (entryPoint) {
-						const trackListEle = node.querySelector(".main-trackList-trackListRow");
-
-						if (!trackListEle) {
-							console.error("Quick Queue: Failed to find tracklist element", node);
-							return;
-						}
-
-						let uri = getTracklistTrackUri(trackListEle);
-						
-						if (!uri) {
-							console.error("Quick Queue: Failed to find URI", trackListEle);
-							return;
-						}
-
-						// Decide insertion target
-						let insertionParent = nodeMatch;
-						let referenceNode = entryPoint;
-
-						if (placeLeftSide) {
-							const rowGrid = nodeMatch.parentElement;
-							const startCell = rowGrid?.querySelector(':scope > .main-trackList-rowSectionStart[role="gridcell"]');
-							const coverImg = startCell?.querySelector(':scope img');
-							if (startCell) {
-								// Avoid duplicate injection in the left cell
-								if (!startCell.querySelector(':scope > .queueControl-wrapper')) {
-									insertionParent = startCell;
-									// If a cover image exists, insert before it. Otherwise insert at the start cell's beginning (some views like albums don't have them)
-									referenceNode = coverImg || startCell.firstElementChild;
-								}
-							}
-						}
-
-						// Avoid duplicate injection in the right cell as well
-						if (insertionParent.querySelector(':scope > .queueControl-wrapper')) return;
-
-						const queueButtonWrapper = document.createElement("div");
-						queueButtonWrapper.className = "queueControl-wrapper";
-						queueButtonWrapper.style.display = "contents";
-						queueButtonWrapper.style.marginRight = 0;
-
-						// Safely insert: only use insertBefore if the reference node belongs to the same parent
-						let queueButtonElement;
-						if (referenceNode && referenceNode.parentNode === insertionParent) {
-							queueButtonElement = insertionParent.insertBefore(queueButtonWrapper, referenceNode);
-						} else if (insertionParent.firstChild) {
-							queueButtonElement = insertionParent.insertBefore(queueButtonWrapper, insertionParent.firstChild);
-						} else {
-							queueButtonElement = insertionParent.appendChild(queueButtonWrapper);
-						}
-						Spicetify.ReactDOM.render(
-							Spicetify.React.createElement(QueueButton, {
-								uri,
-								classList: entryPoint.classList,
-								leftSide: placeLeftSide
-							}),
-							queueButtonElement
-						);
-					}
-				}
-			});
-		});
+		for (const mutation of mutationList) {
+			const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
+			const row = target?.closest?.('[role="row"]');
+			if (row) schedule(row);
+			for (const node of mutation.addedNodes) {
+				if (node.nodeType !== 1) continue;
+				if (node.matches('[role="row"]')) schedule(node);
+				else node.querySelectorAll('[role="row"]').forEach(schedule);
+			}
+		}
 	});
 
 	observer.observe(document, {
 		subtree: true,
 		childList: true
 	});
+	document.querySelectorAll('[role="row"]').forEach(schedule);
 })();
